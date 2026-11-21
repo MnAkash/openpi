@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import functools
 import logging
@@ -83,7 +84,7 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
 
 @at.typecheck
 def init_train_state(
-    config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
+    config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh | None, *, resume: bool
 ) -> tuple[training_utils.TrainState, Any]:
     tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
 
@@ -114,21 +115,27 @@ def init_train_state(
         )
 
     train_state_shape = jax.eval_shape(init, init_rng)
-    state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
+    state_sharding = None if mesh is None else sharding.fsdp_sharding(train_state_shape, mesh, log=True)
 
     if resume:
         return train_state_shape, state_sharding
 
     partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
-    replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    if mesh is None:
+        train_state = jax.jit(
+            init,
+            donate_argnums=(1,),  # donate the partial params buffer.
+        )(init_rng, partial_params)
+    else:
+        replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
-    # Initialize the train state and mix in the partial params.
-    train_state = jax.jit(
-        init,
-        donate_argnums=(1,),  # donate the partial params buffer.
-        in_shardings=replicated_sharding,
-        out_shardings=state_sharding,
-    )(init_rng, partial_params)
+        # Initialize the train state and mix in the partial params.
+        train_state = jax.jit(
+            init,
+            donate_argnums=(1,),  # donate the partial params buffer.
+            in_shardings=replicated_sharding,
+            out_shardings=state_sharding,
+        )(init_rng, partial_params)
 
     return train_state, state_sharding
 
@@ -174,19 +181,8 @@ def train_step(
             ),
         )
 
-    # Filter out params that aren't kernels.
-    kernel_params = nnx.state(
-        model,
-        nnx.All(
-            nnx.Param,
-            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
-            lambda _, x: x.value.ndim > 1,
-        ),
-    )
     info = {
         "loss": loss,
-        "grad_norm": optax.global_norm(grads),
-        "param_norm": optax.global_norm(kernel_params),
     }
     return new_state, info
 
@@ -205,9 +201,12 @@ def main(config: _config.TrainConfig):
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
 
-    mesh = sharding.make_mesh(config.fsdp_devices)
-    data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
-    replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    single_device = jax.device_count() == 1
+    mesh = None if single_device else sharding.make_mesh(config.fsdp_devices)
+    data_sharding = None if single_device else jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
+    replicated_sharding = (
+        None if single_device else jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    )
 
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         config.checkpoint_dir,
@@ -227,11 +226,12 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    if config.wandb_enabled:
+        images_to_log = [
+            wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+            for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        ]
+        wandb.log({"camera_views": images_to_log}, step=0)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -240,12 +240,18 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
-    ptrain_step = jax.jit(
-        functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
-    )
+    if single_device:
+        ptrain_step = jax.jit(
+            functools.partial(train_step, config),
+            donate_argnums=(1,),
+        )
+    else:
+        ptrain_step = jax.jit(
+            functools.partial(train_step, config),
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+        )
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -255,21 +261,27 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
-    infos = []
     for step in pbar:
-        with sharding.set_mesh(mesh):
+        mesh_ctx = sharding.set_mesh(mesh) if mesh is not None else contextlib.nullcontext()
+        with mesh_ctx:
             train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
-        if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+        should_log = step % config.log_interval == 0
+        should_save = (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1
+
+        # Only force device synchronization when we need to inspect or serialize results.
+        if should_log or should_save:
+            train_state = jax.block_until_ready(train_state)
+
+        if should_log:
+            reduced_info = {k: float(v) for k, v in jax.device_get(info).items()}
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
+            if config.wandb_enabled:
+                wandb.log(reduced_info, step=step)
+
         batch = next(data_iter)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+        if should_save:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")

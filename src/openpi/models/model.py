@@ -20,6 +20,7 @@ import torch
 from openpi.models_pytorch import pi0_pytorch
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
+import openpi.training.sharding as training_sharding
 
 logger = logging.getLogger("openpi")
 
@@ -165,7 +166,7 @@ def preprocess_observation(
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad(image, *image_resolution)
 
-        if train:
+        if train and jax.device_count() > 1:
             # Convert from [-1, 1] to [0, 1] for augmax.
             image = image / 2.0 + 0.5
 
@@ -180,6 +181,7 @@ def preprocess_observation(
             transforms += [
                 augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
             ]
+            image = training_sharding.replicated_sharding_constraint(image)
             sub_rngs = jax.random.split(rng, image.shape[0])
             image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
 
@@ -312,7 +314,10 @@ def restore_params(
 
     with ocp.PyTreeCheckpointer() as ckptr:
         metadata = ckptr.metadata(params_path)
-        item = {"params": metadata["params"]}
+        if hasattr(metadata, "item_metadata") and hasattr(metadata.item_metadata, "tree"):
+            item = metadata.item_metadata.tree
+        else:
+            item = {"params": metadata["params"]}
 
         params = ckptr.restore(
             params_path,

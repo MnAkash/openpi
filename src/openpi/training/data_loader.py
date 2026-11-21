@@ -417,7 +417,8 @@ class TorchDataLoader:
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
-        if sharding is None and framework == "jax":
+        self._framework = framework
+        if sharding is None and framework == "jax" and jax.device_count() > 1:
             # Use data parallel sharding by default for JAX only.
             self._sharding = jax.sharding.NamedSharding(
                 jax.sharding.Mesh(jax.devices(), ("B",)),
@@ -464,6 +465,8 @@ class TorchDataLoader:
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                elif self._framework == "jax":
+                    yield jax.tree.map(jnp.asarray, batch)
                 else:
                     yield jax.tree.map(torch.as_tensor, batch)
 
@@ -502,7 +505,7 @@ class RLDSDataLoader:
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
-        if sharding is None:
+        if sharding is None and jax.device_count() > 1:
             # Use data parallel sharding by default.
             sharding = jax.sharding.NamedSharding(
                 jax.sharding.Mesh(jax.devices(), ("B",)),
