@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -20,6 +21,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.spot_real_policy as spot_real_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -32,6 +34,46 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
+
+
+def _dataset_assets_base_dir() -> str:
+    """Where norm stats live for the dataset the shell is pointed at.
+
+    `scripts/dataset_env.sh <robot> <task>` sets DATASET_PATH to
+    data/<robot>/<task>, so stats, checkpoints and the converted LeRobot copy all stay
+    together per dataset and nothing is robot-specific in this file. Falling back to
+    ./assets keeps the upstream configs working in a bare shell.
+    """
+    dataset_path = os.environ.get("DATASET_PATH")
+    if dataset_path:
+        return str(pathlib.Path(dataset_path) / "norm_stats")
+    return "./assets"
+
+
+def _dataset_repo_id(default: str) -> str:
+    """LeRobot repo id of the dataset the shell is pointed at.
+
+    `scripts/dataset_env.sh <robot> <task>` exports LEROBOT_REPO_ID = <robot>_<task>,
+    which is also the norm-stats subdirectory, so one config serves every task of a robot.
+    """
+    return os.environ.get("LEROBOT_REPO_ID", default)
+
+
+def _spot_real_repo_id() -> str:
+    return os.environ.get("SPOT_REAL_REPO_ID", "spot_real_dataset")
+
+
+def _spot_real_assets_base_dir() -> str:
+    return _dataset_assets_base_dir()
+
+
+def _spot_sim_repo_id() -> str:
+    """LeRobot repo id for the H2R 3DGS-rendered Spot data.
+
+    dataset_env.sh sets this to <robot>_<task>, so two datasets can never collide in
+    one LeRobot cache or one norm-stats directory.
+    """
+    return os.environ.get("SPOT_SIM_REPO_ID", "spot_task_cube_no_force")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -352,6 +394,58 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSpotRealDataConfig(DataConfigFactory):
+    """Config for a Spot real HDF5 dataset converted to LeRobot format."""
+
+    default_prompt: str | None = None
+    action_dim: int = 10
+    delta_action_dims: int = 0
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default_factory=lambda: _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/base_image": "base_image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[spot_real_policy.SpotRealInputs(model_type=model_config.model_type)],
+            outputs=[spot_real_policy.SpotRealOutputs(action_dim=self.action_dim)],
+        )
+
+        if self.delta_action_dims > 0:
+            if self.delta_action_dims > self.action_dim:
+                raise ValueError("delta_action_dims must be <= action_dim")
+            mask = _transforms.make_bool_mask(self.delta_action_dims, -(self.action_dim - self.delta_action_dims))
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(mask)],
+                outputs=[_transforms.AbsoluteActions(mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -761,6 +855,142 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+    TrainConfig(
+        name="pi05_spot_real_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSpotRealDataConfig(
+            repo_id=_spot_real_repo_id(),
+            action_dim=10,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        # Sent to the rollout client on connect, so it builds the same observation the
+        # model trained on. Must match convert_spot_real_to_lerobot.py --state-components.
+        policy_metadata={"robot": "spot", "state_components": ["arm_q", "gripper"], "action_components": ["arm"],
+                         "image_size": [320, 240]},
+        assets_base_dir=_spot_real_assets_base_dir(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=16,
+        num_train_steps=20_000,
+        save_interval=1000,
+        keep_period=5000,
+    ),
+    TrainConfig(
+        # H2R 3DGS-rendered Spot data: 25 demonstrations, 1679 frames, two 320x240
+        # camera streams, 8-D state (eef_pos + eef_quat + gripper), 10-D actions
+        # (delta_pos + rot6d + absolute gripper). See README_CUSTOM.md.
+        #
+        # The data transforms are shared with pi05_spot_real_lora: once converted to
+        # LeRobot both datasets present the same base_image / wrist_image / state /
+        # action / prompt fields, so a second copy of those transforms would only be
+        # something to keep in sync.
+        name="pi05_spot_sim_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSpotRealDataConfig(
+            repo_id=_spot_sim_repo_id(),
+            action_dim=10,
+            # prompt_from_task pulls the LeRobot task string, which the converter took
+            # from each demo's task_description attribute.
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        # Sent to the rollout client on connect, so it builds the same observation the
+        # model trained on. Must match convert_spot_sim_to_lerobot.py --state-components.
+        policy_metadata={
+            "robot": "spot",
+            "state_components": ["eef_pos", "eef_quat", "gripper"],
+            "action_components": ["arm"],
+            "image_size": [320, 240],
+        },
+        assets_base_dir=_dataset_assets_base_dir(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        # 1679 frames is a small dataset: a smaller batch gives more optimiser steps per
+        # epoch, and 30k steps at batch 4 is ~71 passes over the data.
+        batch_size=4,
+        num_train_steps=30_000,
+        save_interval=2000,
+        keep_period=10_000,
+    ),
+    #
+    # Stretch 4 (real robot via stretch4_teleop, or the 3DGS simulator's stretch4_teleop
+    # layout), converted by examples/stretch4/convert_stretch4_to_lerobot.py:
+    #   base_image  = images_head_center (240x320 portrait), wrist_image = images_gripper (320x240)
+    #   state       = eef_pos + eef_quat + gripper (8-D, the converter default)
+    #   action      = dpos(3) + rot6d(6) + gripper(1) [+ base_dx, base_dy, base_dyaw]
+    # The converted fields are the same as Spot's, so the Spot input transforms apply.
+    # Two configs because the action width is part of the trained model:
+    #   pi05_stretch4_lora      13-D, arm + base (converter default)
+    #   pi05_stretch4_arm_lora  10-D, arm only   (convert with --no-include-base-actions)
+    #
+    *[
+        TrainConfig(
+            name=name,
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=LeRobotSpotRealDataConfig(
+                repo_id=_dataset_repo_id("stretch4_dataset"),
+                action_dim=action_dim,
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            # Sent to a rollout client on connect. Must match the converter's
+            # --state-components and --include-base-actions. Image sizes are (W, H).
+            policy_metadata={
+                "robot": "stretch4",
+                "state_components": ["eef_pos", "eef_quat", "gripper"],
+                "action_components": action_components,
+                "image_size": {"base_image": [240, 320], "wrist_image": [320, 240]},
+            },
+            assets_base_dir=_dataset_assets_base_dir(),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+            ema_decay=None,
+            batch_size=8,
+            num_train_steps=30_000,
+            save_interval=5000,
+            keep_period=5000,
+        )
+        for name, action_dim, action_components in (
+            ("pi05_stretch4_lora", 13, ["arm", "base"]),
+            ("pi05_stretch4_arm_lora", 10, ["arm"]),
+        )
+    ],
     #
     # Fine-tuning Aloha configs.
     #
